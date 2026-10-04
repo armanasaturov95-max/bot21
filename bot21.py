@@ -22,6 +22,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import JOIN_TRANSITION, Command, CommandStart, ChatMemberUpdatedFilter
 from aiogram.types import (
     BotCommand,
@@ -744,6 +745,26 @@ async def edit_msg(c, text: str, reply_markup=None) -> None:
         logging.warning("Не удалось изменить сообщение: %s", e)
 
 
+FLOOD_EXTRA = 1   # запас (сек) к времени ожидания, которое требует Telegram
+
+
+async def send_msg(bot: Bot, chat_id: int, text: str, reply_markup=None):
+    """Отправка сообщения. Telegram ограничивает группы примерно 20 сообщениями в минуту
+    («Flood control exceeded»). Если лимит сработал — ждём, сколько просит Telegram,
+    и отправляем заново, чтобы игра не зависала. Так же повторяем при сбоях сети."""
+    for attempt in range(1, 5):
+        try:
+            return await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        except TelegramRetryAfter as e:
+            wait = min(float(e.retry_after), 60) + FLOOD_EXTRA
+            logging.warning("Лимит Telegram (попытка %s): жду %.0f сек. и отправляю снова", attempt, wait)
+            await asyncio.sleep(wait)
+        except TelegramNetworkError as e:
+            logging.warning("Сбой сети при отправке (попытка %s): %s", attempt, e)
+            await asyncio.sleep(2)
+    return await bot.send_message(chat_id, text, reply_markup=reply_markup)   # последняя попытка
+
+
 async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, kb=None) -> None:
     try:
         await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
@@ -789,7 +810,7 @@ async def send_turn(bot: Bot, g: Game) -> None:
     """Каждый ход — НОВОЕ сообщение, чтобы его было видно внизу чата."""
     g.phase = "turn"
     g.move_id += 1
-    msg = await bot.send_message(g.chat_id, turn_text(g), reply_markup=turn_kb(g))
+    msg = await send_msg(bot, g.chat_id, turn_text(g), reply_markup=turn_kb(g))
     g.message_id = msg.message_id
     start_timer(bot, g, g.turn_seconds, on_turn_timeout)
 
@@ -920,12 +941,16 @@ async def finish(bot: Bot, g: Game, uid: int, name: str, reason: str) -> None:
         voters=[u for u, _ in g.players if u != uid], category=g.category,
     )
     rounds[r.id] = r
-    msg = await bot.send_message(
-        g.chat_id,
-        f"{reason}\n\n🎯 {mention(uid, name)}, выбирай: ❓ <b>вопрос</b> или 🔥 <b>задание</b>?\n"
-        f"⏱ {CHOOSE_SECONDS} сек, иначе выберу сам",
-        reply_markup=choose_kb(r),
-    )
+    try:
+        msg = await send_msg(bot, 
+            g.chat_id,
+            f"{reason}\n\n🎯 {mention(uid, name)}, выбирай: ❓ <b>вопрос</b> или 🔥 <b>задание</b>?\n"
+            f"⏱ {CHOOSE_SECONDS} сек, иначе выберу сам",
+            reply_markup=choose_kb(r),
+        )
+    except Exception:
+        rounds.pop(r.id, None)   # не оставляем раунд без сообщения
+        raise
     r.message_id = msg.message_id
     set_round_timer(bot, r, CHOOSE_SECONDS, on_choose_timeout)
 
@@ -945,7 +970,7 @@ async def begin_task(bot: Bot, r: Round, kind: str, auto: bool = False) -> None:
     how = f"выбрал(а): <b>{label}</b>" if not auto else f"не выбрал(а), бот взял: <b>{label}</b>"
     await safe_edit(bot, r.chat_id, r.message_id, f"🎯 {mention(r.uid, r.name)} {how}")
     hint = "Ответь честно, потом нажми кнопку." if kind == "q" else "Выполни задание, потом нажми кнопку."
-    msg = await bot.send_message(
+    msg = await send_msg(bot, 
         r.chat_id,
         f"{'❓' if kind == 'q' else '🔥'} {mention(r.uid, r.name)}, твой {label}:\n\n"
         f"<b>{html.escape(text)}</b>\n\n{hint}\nНе хочешь — отказывайся, но будет штраф. ⏱ {DOING_SECONDS} сек",
@@ -961,14 +986,14 @@ async def on_doing_timeout(bot: Bot, r: Round) -> None:
     r.phase = "done"
     rounds.pop(r.id, None)
     await remove_keyboard(bot, r.chat_id, r.message_id)
-    await bot.send_message(r.chat_id, f"⌛ {mention(r.uid, r.name)} так и не ответил(а). Идём дальше: /newgame")
+    await send_msg(bot, r.chat_id, f"⌛ {mention(r.uid, r.name)} так и не ответил(а). Идём дальше: /newgame")
 
 
 async def start_vote(bot: Bot, r: Round) -> None:
     r.phase = "vote"
     cancel_round_timer(r)
     await remove_keyboard(bot, r.chat_id, r.message_id)
-    msg = await bot.send_message(r.chat_id, vote_text(r), reply_markup=vote_kb(r))
+    msg = await send_msg(bot, r.chat_id, vote_text(r), reply_markup=vote_kb(r))
     r.message_id = msg.message_id
     set_round_timer(bot, r, VOTE_SECONDS, on_vote_timeout)
 
@@ -996,11 +1021,11 @@ async def resolve_vote(bot: Bot, r: Round) -> None:
             extra = draw_penalty(r.chat_id)
             text = (f"🙅 Задание не засчитано ({no}:{yes})! {who}, штраф:\n\n"
                     f"<b>{html.escape(extra)}</b>")
-        await bot.send_message(r.chat_id, text + "\n\nЕщё раз: /newgame")
+        await send_msg(bot, r.chat_id, text + "\n\nЕщё раз: /newgame")
     elif not r.votes:
-        await bot.send_message(r.chat_id, f"🤷 Никто не проголосовал — засчитываем {who}. /newgame")
+        await send_msg(bot, r.chat_id, f"🤷 Никто не проголосовал — засчитываем {who}. /newgame")
     else:
-        await bot.send_message(r.chat_id, f"✅ Засчитано ({yes}:{no})! {who} молодец. Ещё раз: /newgame")
+        await send_msg(bot, r.chat_id, f"✅ Засчитано ({yes}:{no})! {who} молодец. Ещё раз: /newgame")
 
 
 async def check_move(c, g, mid: int) -> bool:
@@ -1044,7 +1069,7 @@ async def open_lobby(bot: Bot, chat_id: int, uid: int, name: str) -> None:
     g = Game(chat_id=chat_id, host_id=uid)
     g.players.append((uid, name))
     games[chat_id] = g   # сразу, чтобы два /newgame подряд не создали две игры
-    sent = await bot.send_message(chat_id, lobby_text(g), reply_markup=lobby_kb(g))
+    sent = await send_msg(bot, chat_id, lobby_text(g), reply_markup=lobby_kb(g))
     g.message_id = sent.message_id
 
 
@@ -1269,7 +1294,7 @@ async def cb_newgame(c: CallbackQuery, bot: Bot):
 async def on_added(event: ChatMemberUpdated, bot: Bot):
     if event.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         uname = await bot_username(bot)
-        await bot.send_message(
+        await send_msg(bot, 
             event.chat.id,
             "👋 <b>Всем привет! Я бот для игры «21»</b> 🎲\n\n"
             "Называйте числа по кругу — кто назвал последнее, отвечает на вопрос "
@@ -1609,7 +1634,7 @@ async def cb_cancel(c: CallbackQuery, bot: Bot):
     if c.data == "cancel":
         await edit_msg(c, f"❌ {who} отменил(а) игру.")
     else:
-        await bot.send_message(chat_id, f"🛑 {who} остановил(а) игру. Новая игра: /newgame")
+        await send_msg(bot, chat_id, f"🛑 {who} остановил(а) игру. Новая игра: /newgame")
 
 
 @router.callback_query(F.data == "restart")
@@ -1689,7 +1714,7 @@ async def cb_number(c: CallbackQuery, bot: Bot):
             if pu != uid:
                 kb.button(text=pn[:20], callback_data=f"pick:{pu}")
         kb.adjust(2)
-        msg = await bot.send_message(
+        msg = await send_msg(bot, 
             g.chat_id,
             f"🍀 <b>Счастливая семёрка!</b>\n{mention(uid, name)}, выбери, кому задать вопрос "
             f"(⏱ {PICK_SECONDS} сек, иначе выберу наугад):",
@@ -1814,7 +1839,7 @@ async def cb_round(c: CallbackQuery, bot: Bot):
         await ack(c, )
         await remove_keyboard(bot, r.chat_id, r.message_id)
         pen = draw_penalty(r.chat_id)
-        await bot.send_message(
+        await send_msg(bot, 
             r.chat_id,
             f"🙅 {mention(r.uid, r.name)} отказался(лась)! Штраф:\n\n<b>{html.escape(pen)}</b>\n\nЕщё раз: /newgame",
         )
@@ -1883,6 +1908,10 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await setup_commands(bot)
     await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
