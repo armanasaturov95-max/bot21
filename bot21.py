@@ -465,7 +465,7 @@ PENALTIES_HARD = [
 
 # ----------------------------------------------------------------------------
 # 18+ по уровням: 😏 flirt (флирт) → 🔥 hard (погорячее) → 😈 wild (без тормозов)
-# Доступны, когда админ разрешил /mode18 и создатель игры включил кнопку 🔞
+# Включает и выключает любой: кнопка 🔞 в окне игры или команда /mode18
 # ----------------------------------------------------------------------------
 ADULT_CATS = ["flirt", "hard", "wild"]
 
@@ -732,8 +732,8 @@ def add_caught(chat_id: int, uid: int, name: str) -> None:
 
 
 def game_adult(g) -> bool:
-    """18+ в игре: админ разрешил /mode18 И создатель игры включил кнопку 🔞."""
-    return bool(g.adult and adult_enabled(g.chat_id))
+    """18+ в игре включён, если он включён в чате (кнопка 🔞 или /mode18 — может любой)."""
+    return adult_enabled(g.chat_id)
 
 
 def allowed_cats(chat_id: int, adult: bool | None = None) -> list:
@@ -824,11 +824,9 @@ def players_list(g: Game) -> str:
 
 
 def adult_line(g: Game) -> str:
-    if game_adult(g):
-        return "🔞 Режим 18+: <b>включён</b> для этой игры"
-    if not adult_enabled(g.chat_id):
-        return "🔞 Режим 18+: <b>выключен</b> (админ чата разрешает его командой /mode18)"
-    return "🔞 Режим 18+: <b>выключен</b> (включи кнопкой ниже)"
+    if adult_enabled(g.chat_id):
+        return "🔞 Режим 18+: <b>включён</b> (выключить может любой, кнопкой ниже)"
+    return "🔞 Режим 18+: <b>выключен</b> (включить может любой, кнопкой ниже)"
 
 
 def lobby_text(g: Game) -> str:
@@ -845,7 +843,7 @@ def lobby_text(g: Game) -> str:
         f"😈 На <b>{REVERSE}</b> — порядок ходов разворачивается\n"
         f"🛡 У каждого одна карта: пропустить ход\n\n"
         f"<b>Игроки ({len(g.players)}):</b>\n{players_list(g)}\n\n"
-        f"Настройки меняет создатель игры, а начать и отменить игру может любой."
+        f"Настройки меняет создатель игры, а начать, отменить игру и включить 18+ может любой."
     )
 
 
@@ -1299,7 +1297,7 @@ RULES = (
     "Создатель игры выбирает цель (15/21/31/51), шаг (до +2/+3/+5), "
     "категорию вопросов и ⚡ быстрый режим (15 сек на ход).\n\n"
     "<b>🔞 Режим 18+</b>\n"
-    "Админ чата разрешает 18+ командой /mode18, а создатель игры включает кнопку «🔞 18+» в окне набора. "
+    "Включить и выключить может любой: кнопка «🔞 18+» в окне набора или команда /mode18 (работает и во время игры). "
     "Тогда доступны три уровня: 😏 Флирт, 🔥 Погорячее и 😈 Без тормозов. /hot — случайный вопрос 18+.\n\n"
     "<b>🎭 Мини-игры</b>\n"
     "/wyr — что выберешь · /never — я никогда не · /whom — кто скорее всего · /ship — кто с кем. "
@@ -1324,7 +1322,7 @@ HELP = (
     "/whom — кто скорее всего…\n"
     "/ship — кто с кем?\n\n"
     "<b>Настройки</b>\n"
-    "/mode18 — разрешить или запретить 18+ в чате (только админы)\n\n"
+    "/mode18 — включить или выключить 18+ (может любой)\n\n"
     "<b>Информация</b>\n"
     "/start — приветствие\n"
     "/rules — правила игры\n"
@@ -1342,7 +1340,7 @@ GROUP_COMMANDS = [
     BotCommand(command="whom", description="Кто скорее всего…"),
     BotCommand(command="ship", description="Кто с кем?"),
     BotCommand(command="hot", description="Вопрос 18+ (если разрешено)"),
-    BotCommand(command="mode18", description="Разрешить 18+ (только админы)"),
+    BotCommand(command="mode18", description="Включить или выключить 18+"),
     BotCommand(command="rules", description="Правила игры"),
     BotCommand(command="help", description="Все команды"),
 ]
@@ -1519,12 +1517,12 @@ async def cmd_dare(m: Message):
 
 @router.message(Command("hot"))
 async def cmd_hot(m: Message):
-    """Случайный вопрос 18+ (если админ разрешил режим)."""
+    """Случайный вопрос 18+ (когда режим 18+ включён)."""
     if not in_group(m):
         await m.answer("Эта команда работает в группе 🙂")
         return
     if not adult_enabled(m.chat.id):
-        await m.reply("🔞 Режим 18+ выключен. Админ чата может разрешить его командой /mode18.")
+        await m.reply("🔞 Режим 18+ выключен. Включить может любой: команда /mode18 или кнопка 🔞 в окне новой игры.")
         return
     await m.answer(f"🔞 <b>{html.escape(draw(m.chat.id, 'q', 'adult', True))}</b>")
 
@@ -1551,23 +1549,19 @@ async def cmd_rating(m: Message):
 
 
 @router.message(Command("mode18"))
-async def cmd_mode18(m: Message, bot: Bot):
+async def cmd_mode18(m: Message):
+    """Включить или выключить 18+ в чате. Может любой, работает и во время игры."""
     if not in_group(m):
         await m.answer("Эта команда работает в группе.")
-        return
-    if not await is_admin(bot, m.chat.id, m.from_user.id):
-        await m.reply("Переключать режим 18+ могут только админы.")
         return
     cfg = settings.setdefault(str(m.chat.id), {})
     cfg["adult"] = not cfg.get("adult", False)
     save_settings()
     _bags.clear()
     await m.answer(
-        "🔞 Режим 18+ <b>разрешён</b> в этом чате.\n"
-        "В окне новой игры теперь работает кнопка «🔞 18+»: создатель включает её, "
-        "и появляются уровни 😏 Флирт, 🔥 Погорячее, 😈 Без тормозов. "
-        "Команда /hot даёт случайный вопрос 18+." if cfg["adult"]
-        else "✅ Режим 18+ <b>запрещён</b> в этом чате."
+        "🔞 Режим 18+ <b>включён</b>: в игре доступны уровни 😏 Флирт, 🔥 Погорячее, 😈 Без тормозов. "
+        "Команда /hot даёт вопрос 18+. Выключить: /mode18 или кнопка 🔞 в окне игры." if cfg["adult"]
+        else "✅ Режим 18+ <b>выключен</b>. Включить снова может любой: /mode18 или кнопка 🔞 в окне игры."
     )
 
 
@@ -1849,10 +1843,10 @@ async def cb_set(c: CallbackQuery):
     if not g or g.started:
         await ack(c, )
         return
-    if c.from_user.id != g.host_id:
+    what = c.data[4:]
+    if what != "adult" and c.from_user.id != g.host_id:
         await ack(c, "Настройки меняет создатель игры.")
         return
-    what = c.data[4:]
     if what == "target":
         g.target = cycle(TARGETS, g.target)
     elif what == "step":
@@ -1860,12 +1854,11 @@ async def cb_set(c: CallbackQuery):
     elif what == "cat":
         g.category = cycle(["all", "fun", "love"] + (ADULT_CATS if game_adult(g) else []), g.category)
     elif what == "adult":
-        if not adult_enabled(g.chat_id):
-            await ack(c, "Режим 18+ выключен в этом чате. Админ может разрешить его командой /mode18, "
-                         "и тогда эта кнопка заработает.", show_alert=True)
-            return
-        g.adult = not g.adult
-        if not g.adult and g.category in ADULT_CATS:
+        cfg = settings.setdefault(str(g.chat_id), {})
+        cfg["adult"] = not cfg.get("adult", False)
+        save_settings()
+        _bags.clear()
+        if not cfg["adult"] and g.category in ADULT_CATS:
             g.category = "all"
     elif what == "fast":
         g.fast = not g.fast
